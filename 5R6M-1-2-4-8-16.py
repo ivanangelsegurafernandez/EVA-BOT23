@@ -169,6 +169,7 @@ CTT_THR_RED = 0.15                 # ≤15% de wins en ola
 CTT_LAG_MIN_S = 45                 # rezago mínimo válido
 CTT_LAG_MAX_FACTOR = 2.0           # rezago máximo = 2W
 CTT_REQUIRE_SAME_ASSET = True      # no mezclar activos en consenso
+CTT_ACTIVO_UNICO = "1HZ50V"         # opción 1: todos los bots operan el mismo sintético
 CTT_NEUTRAL_POLICY = "normal"      # normal | block
 CTT_CIERRE_LOOKBACK_MAX = 600       # higiene memoria eventos
 
@@ -12908,14 +12909,16 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
 
     eventos.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
     base = eventos[0]
-    asset = str(base.get("asset", "") or "").upper()
+    asset_target = str(CTT_ACTIVO_UNICO or "").strip().upper()
+    asset = asset_target if asset_target else str(base.get("asset", "") or "").upper()
     ts0 = float(base.get("ts", 0.0) or 0.0)
     ola = []
     for ev in eventos:
         ts = float(ev.get("ts", 0.0) or 0.0)
         if (ts0 - ts) > W:
             continue
-        if bool(CTT_REQUIRE_SAME_ASSET) and asset and str(ev.get("asset", "") or "").upper() != asset:
+        ev_asset = str(ev.get("asset", "") or "").upper()
+        if asset and ev_asset != asset:
             continue
         ola.append(ev)
 
