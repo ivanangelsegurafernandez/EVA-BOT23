@@ -162,6 +162,25 @@ SONAR_SOLO_EN_GATEWIN = True   # Solo sonar dentro de la ventana GateWIN
 SONAR_FUERA_DE_GATEWIN = False # Permitir sonidos fuera de GateWIN si se se habilita
 AUDIO_TIMEOUT_S = 0  # 0 significa sin timeout
 
+# === CTT FASE (Consenso Temporal de Trades cerrados) ===
+CTT_WINDOW_S = 150                 # W: ventana de ola (120-180s recomendado)
+CTT_THR_GREEN = 0.85               # ≥85% de wins en ola
+CTT_THR_RED = 0.15                 # ≤15% de wins en ola
+CTT_LAG_MIN_S = 45                 # rezago mínimo válido
+CTT_LAG_MAX_FACTOR = 2.0           # rezago máximo = 2W
+CTT_REQUIRE_SAME_ASSET = True      # no mezclar activos en consenso
+CTT_NEUTRAL_POLICY = "normal"      # normal | block
+CTT_CIERRE_LOOKBACK_MAX = 600       # higiene memoria eventos
+
+def _ctt_min_confirmadores() -> int:
+    n = int(len(BOT_NAMES))
+    if n >= 10:
+        return 7
+    if n >= 6:
+        return 4
+    return max(1, int(math.ceil(0.7 * n)))
+
+
 # === REMATE (modo cierre solo con WIN) ===
 MODO_REMATE = True           # Continuar hasta WIN o fin de Martingala
 REMATE_SIN_TOPE = False      # Limitado por MAX_CICLOS
@@ -1009,7 +1028,7 @@ def write_token_atomic(path, content):
 # 2) fulll50/fulll45: rendimiento similar pero con muestra algo mayor.
 # 3) fulll48: intermedio, baja muestra.
 # 4) fulll49/fulll46: sobreconfianza alta y peor hit-rate reciente.
-BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46"]
+BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46", "fulll51", "fulll52", "fulll53", "fulll54"]
 IA53_TRIGGERED = {bot: False for bot in BOT_NAMES}
 IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
@@ -1036,6 +1055,20 @@ OCULTAR_HASTA_NUEVO = {bot: False for bot in BOT_NAMES}
 t_inicio_indef = {bot: None for bot in BOT_NAMES}
 last_update_time = {bot: time.time() for bot in BOT_NAMES}
 LAST_REAL_CLOSE_SIG = {bot: None for bot in BOT_NAMES}  # evita procesar el mismo cierre REAL varias veces
+CTT_CLOSE_EVENTS = deque(maxlen=6000)
+CTT_CLOSE_SEEN = set()
+CTT_STATE = {
+    "status": "NEUTRAL",
+    "asset": None,
+    "wave_start": 0.0,
+    "wave_age_s": None,
+    "wave_ratio": 0.0,
+    "wave_total": 0,
+    "confirmadores": 0,
+    "rezagados_validos": [],
+    "sample": 0,
+    "reason": "init",
+}
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
 REAL_LOCK_MISMATCH_SINCE = 0.0
 REAL_LOCK_RECONCILE_S = 6.0
@@ -12785,6 +12818,165 @@ def _umbral_senal_actual_hud() -> float:
         return float(IA_METRIC_THRESHOLD)
 
 # Cargar datos bot
+def _to_epoch_ctt(v) -> float | None:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            x = float(v)
+            if x > 1e12:
+                x /= 1000.0
+            return x if x > 0 else None
+        txt = str(v).strip()
+        if not txt:
+            return None
+        if txt.isdigit():
+            x = float(txt)
+            if x > 1e12:
+                x /= 1000.0
+            return x if x > 0 else None
+        dt = pd.to_datetime(txt, errors="coerce", utc=True)
+        if pd.isna(dt):
+            return None
+        return float(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _infer_close_ts_ctt(fila_dict: dict) -> float:
+    keys = ("close_time", "timestamp_cierre", "epoch_cierre", "exit_epoch", "sell_time", "fecha_cierre", "timestamp", "epoch")
+    for k in keys:
+        ts = _to_epoch_ctt(fila_dict.get(k))
+        if isinstance(ts, (int, float)) and ts > 0:
+            return float(ts)
+    return float(time.time())
+
+
+def _close_sig_ctt(bot: str, fila_dict: dict, ts_close: float, result_bin: int) -> str:
+    parts = [str(bot), str(int(ts_close)), str(int(result_bin))]
+    for k in ("contract_id", "buy_contract_id", "transaction_id", "id", "epoch"):
+        v = fila_dict.get(k)
+        if v not in (None, ""):
+            parts.append(f"{k}:{v}")
+            break
+    parts.append(str(fila_dict.get("activo", "")))
+    return "|".join(parts)
+
+
+def _registrar_cierre_ctt(bot: str, fila_dict: dict, resultado: str):
+    try:
+        result_bin = 1 if str(resultado).upper() == "GANANCIA" else 0
+        ts_close = float(_infer_close_ts_ctt(fila_dict))
+        asset = str(fila_dict.get("activo", "") or "").strip().upper()
+        sig = _close_sig_ctt(bot, fila_dict, ts_close, result_bin)
+        if sig in CTT_CLOSE_SEEN:
+            return
+        CTT_CLOSE_SEEN.add(sig)
+        CTT_CLOSE_EVENTS.append({"ts": ts_close, "bot": str(bot), "asset": asset, "result": int(result_bin), "sig": sig})
+        cutoff_seen = float(time.time()) - float(CTT_CIERRE_LOOKBACK_MAX)
+        if len(CTT_CLOSE_SEEN) > 12000:
+            # rebuild seen desde deque para evitar crecimiento indefinido
+            CTT_CLOSE_SEEN.clear()
+            for ev in CTT_CLOSE_EVENTS:
+                try:
+                    if float(ev.get("ts", 0.0)) >= cutoff_seen:
+                        CTT_CLOSE_SEEN.add(str(ev.get("sig")))
+                except Exception:
+                    continue
+    except Exception:
+        return
+
+
+def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
+    now = float(time.time())
+    W = float(CTT_WINDOW_S)
+    lag_max = float(CTT_LAG_MAX_FACTOR) * W
+    cutoff = now - max(W, float(CTT_CIERRE_LOOKBACK_MAX))
+
+    eventos = []
+    for ev in list(CTT_CLOSE_EVENTS):
+        try:
+            ts = float(ev.get("ts", 0.0) or 0.0)
+            if ts >= cutoff:
+                eventos.append(ev)
+        except Exception:
+            continue
+    if not eventos:
+        st = {"status": "NEUTRAL", "reason": "sin_eventos", "sample": 0, "rezagados_validos": []}
+        CTT_STATE.update(st)
+        return list(candidatos), st
+
+    eventos.sort(key=lambda x: float(x.get("ts", 0.0)), reverse=True)
+    base = eventos[0]
+    asset = str(base.get("asset", "") or "").upper()
+    ts0 = float(base.get("ts", 0.0) or 0.0)
+    ola = []
+    for ev in eventos:
+        ts = float(ev.get("ts", 0.0) or 0.0)
+        if (ts0 - ts) > W:
+            continue
+        if bool(CTT_REQUIRE_SAME_ASSET) and asset and str(ev.get("asset", "") or "").upper() != asset:
+            continue
+        ola.append(ev)
+
+    bots_wave = {str(ev.get("bot")) for ev in ola}
+    confirmadores = len(bots_wave)
+    sample = len(ola)
+    wins = sum(int(ev.get("result", 0) or 0) for ev in ola)
+    ratio = (wins / sample) if sample > 0 else 0.0
+    wave_age_s = max(0.0, now - ts0) if ts0 > 0 else None
+
+    status = "NEUTRAL"
+    reason = "muestra_insuficiente"
+    if sample > 0 and confirmadores >= int(_ctt_min_confirmadores()) and (wave_age_s is None or wave_age_s <= W):
+        if ratio >= float(CTT_THR_GREEN):
+            status = "GREEN"
+            reason = "ola_green"
+        elif ratio <= float(CTT_THR_RED):
+            status = "RED"
+            reason = "ola_red"
+        else:
+            reason = "zona_neutral"
+
+    last_ts_bot = {}
+    for ev in eventos:
+        b = str(ev.get("bot"))
+        if b not in last_ts_bot:
+            last_ts_bot[b] = float(ev.get("ts", 0.0) or 0.0)
+
+    rezagados_validos = []
+    for b in BOT_NAMES:
+        tsb = float(last_ts_bot.get(str(b), 0.0) or 0.0)
+        if tsb <= 0:
+            continue
+        lag = max(0.0, ts0 - tsb)
+        if float(CTT_LAG_MIN_S) <= lag <= float(lag_max):
+            rezagados_validos.append(str(b))
+
+    filtrados = list(candidatos)
+    if status == "RED":
+        filtrados = []
+    elif status == "GREEN":
+        filtrados = [c for c in candidatos if len(c) > 1 and str(c[1]) in set(rezagados_validos)]
+    elif status == "NEUTRAL" and str(CTT_NEUTRAL_POLICY).lower() == "block":
+        filtrados = []
+
+    st = {
+        "status": status,
+        "asset": asset or None,
+        "wave_start": ts0,
+        "wave_age_s": wave_age_s,
+        "wave_ratio": float(ratio),
+        "wave_total": int(sample),
+        "confirmadores": int(confirmadores),
+        "rezagados_validos": list(rezagados_validos),
+        "sample": int(sample),
+        "reason": reason,
+    }
+    CTT_STATE.update(st)
+    return filtrados, st
+
+# Cargar datos bot
 # Cargar datos bot
 async def cargar_datos_bot(bot, token_actual):
     ruta = f"registro_enriquecido_{bot}.csv"
@@ -12961,6 +13153,7 @@ async def cargar_datos_bot(bot, token_actual):
             # 2) FILAS CERRADAS (GANANCIA / PÉRDIDA)
             #    - Aquí sí actualizamos historial y estadísticas reales
             # =========================
+            _registrar_cierre_ctt(bot, fila_dict, resultado)
             estado_bots[bot]["ultimo_resultado"] = resultado
             estado_bots[bot]["resultados"].append(resultado)
             estado_bots[bot]["tamano_muestra"] += 1
@@ -13764,6 +13957,22 @@ async def main():
                                     continue
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
+
+                            candidatos_prev = len(candidatos)
+                            candidatos, ctt_eval = evaluar_ctt_fase(candidatos)
+                            if candidatos_prev > 0:
+                                ctt_status = str(ctt_eval.get("status", "NEUTRAL"))
+                                if ctt_status == "RED":
+                                    agregar_evento(
+                                        f"🟥 CTT veto: ola {ctt_eval.get('asset','NA') or 'NA'} "
+                                        f"wr={float(ctt_eval.get('wave_ratio',0.0))*100:.1f}% "
+                                        f"m={int(ctt_eval.get('confirmadores',0))}/{_ctt_min_confirmadores()}."
+                                    )
+                                elif ctt_status == "GREEN" and len(candidatos) < candidatos_prev:
+                                    agregar_evento(
+                                        f"🟩 CTT fase: {len(candidatos)}/{candidatos_prev} candidatos rezagados válidos "
+                                        f"(lag {int(CTT_LAG_MIN_S)}-{int(CTT_LAG_MAX_FACTOR*CTT_WINDOW_S)}s)."
+                                    )
 
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
