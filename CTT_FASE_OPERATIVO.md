@@ -1,284 +1,244 @@
 # CTT-Fase Operativo (Candado principal por contexto y desfase)
 
-> Documento lógico (sin código) para operar el **Consenso de Tendencia Temporal (CTT)** como filtro principal de contexto.
+> Documento lógico (sin código) para operar CTT-Fase como filtro contextual principal.
 
-## 0) Definición corta (sin maquillaje)
+## 1) Qué es CTT exactamente
 
-CTT es un **filtro de clima de mercado** basado en cierres recientes del grupo de bots.
-
-- 🟢 **Marea verde**: predominan aciertos recientes.
-- 🔴 **Marea roja**: predominan fallos recientes.
+CTT es un filtro de contexto (“meteorología” del mercado) construido sobre el resultado reciente del grupo:
+- 🟢 **Marea verde**: muchos aciertos recientes.
+- 🔴 **Marea roja**: muchos fallos recientes.
 - ⚪ **Neutro**: ruido o evidencia insuficiente.
 
 Uso correcto:
-- En 🔴: CTT **bloquea/endurece**.
-- En 🟢: CTT **permite/prioriza** solo si la lógica base ya dijo GO.
-- CTT **nunca** debe abrir una operación por sí solo.
+- 🔴 bloquea o endurece entradas.
+- 🟢 permite/prioriza **solo si** la lógica base ya aprobó.
+- CTT **nunca** abre operación por sí solo.
 
 ---
 
-## 1) Qué significa “fase” y “desfase” entre bots
+## 2) Fase y desfase (sin inventar)
 
-Cada bot tiene ritmo propio de apertura/cierre.
-La fase es la posición temporal relativa entre bots.
+Cada bot tiene ritmo temporal de apertura/cierre. Su fase es su posición en el tiempo respecto al grupo.
 
-Se detecta desfase real con dos timestamps por bot:
+Timestamps mínimos por bot:
 - `last_open_ts`
 - `last_close_ts`
 
-Criterio mínimo de desfase grupal:
-- si `max(last_close_ts) - min(last_close_ts)` supera umbral (10–30s), hay desfase explotable.
-
-Esto evita inventar “sincronías” donde no existen.
+Desfase grupal real:
+- si `max(last_close_ts) - min(last_close_ts) > umbral` (10–30s), hay desfase explotable.
 
 ---
 
-## 2) Núcleo operativo CTT (línea de tiempo global)
+## 3) Núcleo CTT: línea de tiempo global de cierres
 
-### 2.1 Registro único de cierres
+Cada cierre se registra como:
+- `(timestamp_real_cierre, bot_id, result)` con `result ∈ {win/check, loss/x}`.
 
-Cada cierre del grupo se guarda como evento:
-- `(timestamp_real_cierre, bot_id, result)`
-- `result ∈ {win/check, loss/x}`
+Regla crítica:
+- usar timestamp real de cierre, no timestamp de log/print (evita desorden por latencia).
 
-**Importante**: usar timestamp real de cierre, no timestamp de impresión/log.
-
-### 2.2 Consenso básico
-
-En la ventana activa:
+Consenso base en ventana activa:
 - `consensus_win = wins / N`
 - `consensus_loss = losses / N`
 
-Umbrales base recomendados:
-- Verde si `consensus_win >= 0.80`
-- Rojo si `consensus_win <= 0.20`
-- Neutro en zona intermedia
+Estados mínimos:
+- Verde: `consensus_win >= 0.80`
+- Rojo: `consensus_win <= 0.20`
+- Neutro: resto
 
-### 2.3 Confianza mínima (anti-muestra chica)
-
-Si `N < N_min`, CTT no opina:
-- estado = ⚪ Neutro.
-
-Regla práctica robusta:
-- con 6 bots: `N_min = 6–8`
-- con 10 bots: `N_min = 10–12`
+Si `N < N_min`, CTT no opina (Neutro).
 
 ---
 
-## 3) Ventanas de tiempo: el cuello de botella real
+## 4) Solución al cuello de botella: usar **3 relojes**, no uno
 
-CTT no mira velas; mira cierres en tiempo común.
+El error típico es mezclar todo en una sola ventana. CTT-Fase necesita 3 capas temporales:
 
-### 3.1 Modelos de ventana
+### 4.1 Reloj A: Ventana de ola (`W_wave`)
+Pregunta: **¿sigue viva la misma marea?**
 
-1. **Solo tiempo (`W`)**: últimos `W` segundos.
-2. **Solo cantidad (`N`)**: últimos `N` cierres.
-3. **Híbrida (recomendada)**: últimos `N_target` cierres, siempre que estén dentro de `W`.
+- Evalúa consenso colectivo de cierres.
+- Para operaciones ~1m: `W_wave = 120–180s`.
 
-La híbrida evita dos trampas:
-- consenso fósil (cierres viejos),
-- consenso sin evidencia (pocos cierres en `W`).
+### 4.2 Reloj B: Ventana de rezago (`LAG_MIN..LAG_MAX`)
+Pregunta: **¿este bot llega tarde pero aún pertenece a la ola?**
 
-### 3.2 Cómo fijar W y N sin adivinar
+- Para `D≈60s`: `LAG_MIN=30–45s`, `LAG_MAX=90–120s`.
+- `<LAG_MIN`: diferencia normal (no rezago útil).
+- `>LAG_MAX`: rezago viejo/desconectado.
 
-Atar parámetros a:
-- `D` = duración típica de operación,
-- `B` = bots activos.
+### 4.3 Reloj C: Expiración del permiso (`TTL_wave`)
+Pregunta: **¿aunque fue verde, todavía sirve operar?**
 
-Reglas:
-- `W ≈ 2D a 3D`
-- `N_target ≈ 2B`
-- `N_min ≈ B`
-
-Ejemplo `D=60s`:
-- 6 bots: `W=180s`, `N_target=12`, `N_min=6–8`
-- 10 bots: `W=120–180s`, `N_target=20`, `N_min=10–12`
+- La ola nace con su primer cierre confirmador.
+- La ola deja de habilitar cuando vence su TTL.
+- Base recomendada: `TTL_wave ≈ W_wave` (o algo más estricto, p. ej. 120–150s si `W_wave=180s`).
 
 ---
 
-## 4) Confirmadores vs rezagados (CTT-Fase real)
+## 5) Ventana híbrida con frente de ola (mejora clave)
 
-### 4.1 Confirmadores
-Bots que ya cerraron dentro de la ola (`W`).
+No basta “últimos N” o “últimos W desde ahora”.
 
-### 4.2 Rezagados
-Bots que aún no cerraron en esa ola o cuyo último cierre quedó retrasado respecto al frente.
+Definición robusta:
+- `t_front = timestamp del cierre más reciente del grupo`.
+- Ola activa = cierres dentro de `[t_front - W_wave, t_front]`.
 
-### 4.3 Métrica correcta de confirmación
+Luego aplicar límite de cantidad:
+- usar hasta `N_target` cierres de esa banda temporal.
 
-No usar porcentaje sobre todos los bots.
+Esto evita consenso fósil y desalineaciones por ritmo desigual entre bots.
+
+---
+
+## 6) Confirmadores vs rezagados (columna vertebral)
+
+### Confirmadores
+Bots que ya cerraron dentro de la ola activa.
+
+### Rezagados
+Bots que aún no cerraron en la ola o quedaron atrás del frente.
+
+### Métrica correcta
+No usar `wins / total_bots`.
 Usar:
-- `confirm_win_rate = wins_confirmadores / n_confirmadores`
+- `confirm_win_rate = wins_confirmadores / n_confirmadores`.
 
-Condición de ola verde confirmada:
-- `n_confirmadores >= M_min`
-- `confirm_win_rate >= T_green`
-
-Condición de ola roja confirmada:
-- `n_confirmadores >= M_min`
-- `confirm_win_rate <= T_red`
-
-Sugerencia inicial:
-- 6 bots: `M_min=4–5`, `T_green=0.80–0.85`, `T_red=0.15–0.20`
-- 10 bots: `M_min=7`, `T_green=0.85–0.90`, `T_red=0.10–0.15`
+Los rezagados no son evidencia; son candidatos.
 
 ---
 
-## 5) Rezago válido (para no confundir bot muerto con oportunidad)
+## 7) Reglas de estado CTT-Fase
 
-Definir frente del grupo:
+Con evidencia mínima `n_confirmadores >= M_min`:
+- Verde fuerte: `confirm_win_rate >= T_green`
+- Rojo fuerte: `confirm_win_rate <= T_red`
+- Neutro: zona intermedia o evidencia insuficiente
+
+Recomendación inicial:
+- **6 bots**: `M_min=4–5`, `T_green=0.80–0.85`, `T_red=0.15–0.20`
+- **10 bots**: `M_min=7`, `T_green=0.85–0.90`, `T_red=0.10–0.15`
+
+Con 6 bots, exigir 90% rígido suele ser demasiado estricto.
+
+---
+
+## 8) Rezago válido (evitar “bot muerto”)
+
+Definir frente:
 - `t_front = max(last_close_ts)`
 
 Lag por bot:
 - `lag_bot = t_front - last_close_ts(bot)`
 
-Bot rezagado válido si:
-- está activo,
-- `LAG_MIN <= lag_bot <= LAG_MAX`.
-
-Sugerencia `D≈60s`:
-- `LAG_MIN = 30–45s`
-- `LAG_MAX = 90–120s` (o hasta `2W` según régimen)
+Rezagado válido si:
+- bot activo,
+- `LAG_MIN <= lag_bot <= LAG_MAX`,
+- sigue dentro de `TTL_wave` de la ola activa.
 
 ---
 
-## 6) Expiración de ola (pieza crítica)
+## 9) Política operativa: candado asimétrico (rojo > verde)
 
-La ola no dura infinito.
-
-Regla:
-- si desde el primer cierre de la ola pasaron más de `W`, la ola expira.
-- ola expirada no habilita entradas, aunque su ratio histórico se vea bonito.
-
-Esto evita entrar tarde al final de una racha.
-
----
-
-## 7) CTT como candado principal: política operativa
-
-Orden recomendado:
-1. Sanidad dura (token, saldo, locks, hard guards)
-2. Señal individual (trigger, confirm, p_oper)
-3. CTT-Fase (contexto)
+Orden de compuertas:
+1. Sanidad dura (token/saldo/locks/hard guard)
+2. Señal individual (trigger/confirm/p_oper)
+3. CTT-Fase
 4. Ejecución
 
 Reglas:
-- 🔴 + rezagado válido ⇒ **NO-GO duro**
-- 🟢 + rezagado válido ⇒ **permiso condicionado** (solo si base ya aprobó)
-- ⚪ Neutro ⇒ lógica base normal
+- 🔴 fuerte + rezagado válido ⇒ **NO-GO duro**.
+- 🔴 débil ⇒ endurecer umbral y/o confirmaciones.
+- ⚪ neutro ⇒ manda lógica base.
+- 🟢 débil ⇒ observación (sin relajación).
+- 🟢 fuerte + rezagado válido + ola viva ⇒ permiso/relajación moderada.
 
-Principio:
-- CTT tiene más peso para **bloquear en rojo** que para “empujar” en verde.
-
----
-
-## 8) Modulación del candado (sin aflojar a martillazos)
-
-No usar un único umbral fijo ciego.
-Usar umbral contextual:
-
-- Rojo fuerte: endurecer fuerte / bloqueo
-- Rojo débil: endurecer moderado
-- Neutro: umbral base
-- Verde débil: observación (sin regalo)
-- Verde fuerte + rezago válido: relajación moderada
-
-Ejemplo conceptual sobre base 60%:
-- Rojo: 63–66%
-- Neutro: 60%
-- Verde fuerte + rezago válido: 56–58%
-
-CTT modula severidad; no crea entradas.
+CTT modula severidad; no dispara entradas.
 
 ---
 
-## 9) Bots clones y redundancia (riesgo silencioso)
+## 10) Consenso fósil: el error a evitar
 
-Si varios bots son muy parecidos, pueden “votar igual” por la misma causa.
-Eso puede inflar consenso falso.
+Qué es:
+- usar cierres “recientes” en cantidad pero viejos en régimen operativo.
 
-Mitigación lógica:
-- consenso diverso = mayor confianza,
-- consenso redundante = “verde con asterisco” (menos relajación).
+Blindaje:
+1. banda temporal dura con `W_wave`,
+2. ola anclada al `t_front`,
+3. expiración por `TTL_wave`.
 
-Cómo ganar valor con más bots sin cambiar estrategia base:
+---
+
+## 11) Bots homogéneos: consenso correlacionado
+
+Con bots similares, el consenso no es independencia estadística plena.
+
+Lectura correcta:
+- CTT funciona mejor como detector de régimen que como multiplicador ingenuo de probabilidad.
+
+Mitigación:
 - offsets temporales,
-- pequeñas variaciones de confirmación,
+- micro-variaciones de umbral/confirmación,
 - ventanas de features distintas,
 - cooldowns diferentes.
 
 ---
 
-## 10) Martingala C2..C6 (criterio prudente)
+## 12) Parámetros iniciales (operación ~1m)
 
-Para continuidad de ciclo:
-- aplicar CTT sobre todo como **bloqueo rojo**,
-- evitar usar verde como “boost” agresivo en escalones avanzados.
-
-Motivo: proteger capital cuando el régimen se vuelve adverso.
-
----
-
-## 11) Parámetros iniciales listos para operar
-
-### Escenario A: 6 bots (actual)
-- `W = 180s`
+### Escenario 6 bots
+- `W_wave = 180s`
 - `N_target = 12`
-- `N_min = 6–8`
-- `M_min = 4–5`
+- `N_min = 6`
+- `M_min = 4`
+- `T_green = 0.80`
+- `T_red = 0.20`
 - `LAG_MIN = 45s`
-- `LAG_MAX = 90–120s`
-- Verde: `>=0.80` (fuerte desde `0.85`)
-- Rojo: `<=0.20` (fuerte desde `0.15`)
+- `LAG_MAX = 120s`
+- `TTL_wave = 120–180s`
 
-### Escenario B: 10 bots (escalado)
-- `W = 120–180s`
+### Escenario 10 bots
+- `W_wave = 120–180s`
 - `N_target = 20`
 - `N_min = 10–12`
 - `M_min = 7`
+- `T_green = 0.85`
+- `T_red = 0.15`
 - `LAG_MIN = 45s`
-- `LAG_MAX = 90–120s`
-- Verde fuerte: `>=0.85–0.90`
-- Rojo fuerte: `<=0.10–0.15`
+- `LAG_MAX = 120s`
+- `TTL_wave = 120–180s`
 
 ---
 
-## 12) Qué hacer en estado de warmup / confiabilidad baja
+## 13) Martingala C2..C6 (prudencia)
 
-Cuando el modelo aún está inmaduro:
-- no usar prob IA cruda como llave única,
-- usar CTT-Fase para control de régimen,
-- priorizar evitar rojos sobre perseguir verdes.
-
-Traducción operativa:
-- primero reducir errores de contexto,
-- luego exprimir precisión de probabilidad individual.
+En continuidad de ciclo:
+- usar CTT sobre todo como bloqueo rojo,
+- evitar boost verde agresivo en escalones avanzados.
 
 ---
 
-## 13) Checklist de implementación mental (sin código)
+## 14) Checklist final (sin código)
 
-1. Definir `W`, `N_target`, `N_min`, `M_min`, `LAG_MIN`, `LAG_MAX`.
-2. Construir línea de cierres con timestamp real.
-3. Separar confirmadores y rezagados.
-4. Calcular estado CTT con evidencia mínima.
-5. Aplicar expiración de ola.
-6. Modular umbral según estado CTT (rojo > verde en peso).
-7. Exigir mínimos base siempre.
-8. Penalizar consenso redundante.
+1. Definir los 3 relojes: `W_wave`, `LAG_MIN..LAG_MAX`, `TTL_wave`.
+2. Construir ola con frente `t_front`.
+3. Separar confirmadores de rezagados.
+4. Exigir evidencia mínima (`N_min`, `M_min`).
+5. Calcular estado por `confirm_win_rate`.
+6. Invalidar olas expiradas.
+7. Aplicar candado asimétrico (rojo > verde).
+8. Exigir mínimos base siempre.
 9. Auditar rendimiento por régimen (verde/rojo/neutro).
 
 ---
 
-## 14) Resumen ejecutivo
+## 15) Resumen ejecutivo
 
-CTT-Fase correcto = **Confirmación de ola + Entrada por rezago válido**.
+CTT-Fase robusto = **Confirmación de ola + Entrada por rezago válido + Expiración temporal**.
 
-- Mayoría de confirmadores valida el régimen.
-- Solo rezagados válidos pueden aprovechar esa ola.
-- Si aparece ola roja, se bloquea duro.
-- Si falta evidencia, CTT no opina (neutro).
+- Si la mayoría confirmadora valida ola verde y aún está viva, habilitas rezagados válidos (con mínimos base).
+- Si la ola es roja, bloqueas duro.
+- Si falta evidencia, CTT queda neutro.
 
-Conclusión:
-La mejora real no es bajar el candado fijo.
-La mejora real es volverlo **contextual, temporal y disciplinado por fase**.
+La mejora real no es bajar un umbral fijo.
+La mejora real es operar con contexto temporal de fase.

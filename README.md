@@ -2,4 +2,4 @@
 
 ## Documento de estrategia
 
-- `CTT_FASE_OPERATIVO.md`: guía operativa (sin código) para usar CTT-Fase como candado principal por contexto, con ventanas híbridas, confirmadores vs rezagados, expiración de ola y modulación de umbrales.
+- `CTT_FASE_OPERATIVO.md`: especificación operativa (sin código) de CTT-Fase como candado principal, incluyendo 3 relojes temporales (ola, rezago y expiración), frente de ola, confirmadores/rezagados y política asimétrica rojo-verde.
