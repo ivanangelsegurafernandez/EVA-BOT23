@@ -163,15 +163,24 @@ SONAR_FUERA_DE_GATEWIN = False # Permitir sonidos fuera de GateWIN si se se habi
 AUDIO_TIMEOUT_S = 0  # 0 significa sin timeout
 
 # === CTT FASE (Consenso Temporal de Trades cerrados) ===
-CTT_WINDOW_S = 150                 # W: ventana de ola (120-180s recomendado)
-CTT_THR_GREEN = 0.85               # ≥85% de wins en ola
-CTT_THR_RED = 0.15                 # ≤15% de wins en ola
+# 3 relojes: ola (WAVE), rezago (LAG) y expiración de permiso (TTL)
+CTT_WAVE_WINDOW_S = 180            # W_wave: ventana de ola (120-180s recomendado)
+CTT_WAVE_TTL_S = 150               # TTL_wave: permiso útil de la ola (<= W_wave)
+CTT_THR_GREEN = 0.85               # Verde fuerte de régimen
+CTT_THR_GREEN_OPERABLE = 0.85      # Verde operable: habilita solo con rezago válido + ola viva
+CTT_THR_GREEN_WEAK = 0.75          # Verde diagnóstica mínima
+CTT_THR_RED = 0.15                 # Rojo fuerte de régimen
+CTT_THR_RED_WEAK = 0.25            # Rojo débil (endurece, no siempre veto total)
 CTT_LAG_MIN_S = 45                 # rezago mínimo válido
-CTT_LAG_MAX_FACTOR = 2.0           # rezago máximo = 2W
+CTT_LAG_MAX_S = 120                # rezago máximo válido (evita "arqueología")
+CTT_DENSITY_MIN_CPM = 1.6          # densidad mínima de cierres/min para verde operable
+CTT_RED_WEAK_SCORE_PENALTY = 0.02  # castigo suave en rojo débil
+CTT_GREEN_OPERABLE_SCORE_BONUS = 0.01  # premio leve en verde operable
 CTT_REQUIRE_SAME_ASSET = True      # no mezclar activos en consenso
 CTT_ACTIVO_UNICO = "1HZ50V"         # opción 1: todos los bots operan el mismo sintético
 CTT_NEUTRAL_POLICY = "normal"      # normal | block
 CTT_CIERRE_LOOKBACK_MAX = 600       # higiene memoria eventos
+CTT_ENABLE_GREEN_IN_MARTI_ADVANCED = False  # C2..C6: CTT actúa como freno más que como habilitador
 
 def _ctt_min_confirmadores() -> int:
     n = int(len(BOT_NAMES))
@@ -1060,14 +1069,25 @@ CTT_CLOSE_EVENTS = deque(maxlen=6000)
 CTT_CLOSE_SEEN = set()
 CTT_STATE = {
     "status": "NEUTRAL",
+    "regime": "NEUTRAL",
+    "gate": "NEUTRAL",
     "asset": None,
+    "t_front": 0.0,
     "wave_start": 0.0,
     "wave_age_s": None,
+    "wave_ttl_ok": False,
     "wave_ratio": 0.0,
     "wave_total": 0,
     "confirmadores": 0,
+    "density_cpm": 0.0,
+    "diversity_ratio": 0.0,
+    "redundancy_high": False,
+    "green_mode": "none",
     "rezagados_validos": [],
+    "no_participantes": [],
     "sample": 0,
+    "roof_policy": "normal",
+    "roof_delta": 0.0,
     "reason": "init",
 }
 REAL_OWNER_LOCK = None  # owner REAL en memoria (evita carreras de lectura de archivo)
@@ -10582,6 +10602,16 @@ def mostrar_panel():
                 why_reasons.append(f"confirm_pending({confirm_txt_h})")
             if not trigger_ok_h:
                 why_reasons.append("trigger_no")
+            try:
+                ctt_status_h = str(CTT_STATE.get("status", "NEUTRAL") or "NEUTRAL")
+                ctt_gate_h = str(CTT_STATE.get("gate", "NEUTRAL") or "NEUTRAL")
+                ctt_reason_h = str(CTT_STATE.get("reason", "na") or "na")
+                if ctt_gate_h == "BLOCK":
+                    why_reasons.append(f"ctt_block({ctt_status_h.lower()}:{ctt_reason_h})")
+                elif ctt_status_h in {"RED_WEAK", "GREEN_DIAGNOSTIC"}:
+                    why_reasons.append(f"ctt_{ctt_status_h.lower()}({ctt_reason_h})")
+            except Exception:
+                pass
             why_txt = "none" if not why_reasons else ",".join(why_reasons)
 
             p_raw_best = None
@@ -12890,8 +12920,10 @@ def _registrar_cierre_ctt(bot: str, fila_dict: dict, resultado: str):
 
 def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
     now = float(time.time())
-    W = float(CTT_WINDOW_S)
-    lag_max = float(CTT_LAG_MAX_FACTOR) * W
+    W = float(CTT_WAVE_WINDOW_S)
+    ttl_wave = float(max(1.0, min(CTT_WAVE_TTL_S, CTT_WAVE_WINDOW_S)))
+    lag_min = float(max(0.0, CTT_LAG_MIN_S))
+    lag_max = float(max(lag_min, CTT_LAG_MAX_S))
     cutoff = now - max(W, float(CTT_CIERRE_LOOKBACK_MAX))
 
     eventos = []
@@ -12902,8 +12934,24 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
                 eventos.append(ev)
         except Exception:
             continue
+
     if not eventos:
-        st = {"status": "NEUTRAL", "reason": "sin_eventos", "sample": 0, "rezagados_validos": []}
+        st = {
+            "status": "NEUTRAL",
+            "regime": "NEUTRAL",
+            "gate": "NEUTRAL",
+            "reason": "sin_eventos",
+            "sample": 0,
+            "rezagados_validos": [],
+            "no_participantes": list(BOT_NAMES),
+            "green_mode": "none",
+            "density_cpm": 0.0,
+            "diversity_ratio": 0.0,
+            "redundancy_high": False,
+            "wave_ttl_ok": False,
+            "roof_policy": "not_evaluated",
+            "roof_delta": 0.0,
+        }
         CTT_STATE.update(st)
         return list(candidatos), st
 
@@ -12911,11 +12959,13 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
     base = eventos[0]
     asset_target = str(CTT_ACTIVO_UNICO or "").strip().upper()
     asset = asset_target if asset_target else str(base.get("asset", "") or "").upper()
-    ts0 = float(base.get("ts", 0.0) or 0.0)
+    t_front = float(base.get("ts", 0.0) or 0.0)
+
+    # Ola activa anclada al frente temporal del grupo.
     ola = []
     for ev in eventos:
         ts = float(ev.get("ts", 0.0) or 0.0)
-        if (ts0 - ts) > W:
+        if (t_front - ts) > W:
             continue
         ev_asset = str(ev.get("asset", "") or "").upper()
         if asset and ev_asset != asset:
@@ -12927,19 +12977,82 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
     sample = len(ola)
     wins = sum(int(ev.get("result", 0) or 0) for ev in ola)
     ratio = (wins / sample) if sample > 0 else 0.0
-    wave_age_s = max(0.0, now - ts0) if ts0 > 0 else None
+    wave_age_s = max(0.0, now - t_front) if t_front > 0 else None
+    ts_min = min((float(ev.get("ts", 0.0) or 0.0) for ev in ola), default=t_front)
+    span_s = max(1.0, float(t_front - ts_min)) if sample > 1 else 1.0
+    density_cpm = float(sample * 60.0 / span_s)
+    wave_ttl_ok = bool((wave_age_s is None) or (wave_age_s <= ttl_wave))
 
+    # Diversidad aproximada: confirmadores únicos sobre tamaño de muestra.
+    diversity_ratio = float(confirmadores / max(1, sample))
+    redundancy_high = bool(sample >= max(4, int(_ctt_min_confirmadores())) and diversity_ratio < 0.45)
+
+    regime = "NEUTRAL"
+    gate = "NEUTRAL"
     status = "NEUTRAL"
+    green_mode = "none"
+    roof_policy = "normal"
+    roof_delta = 0.0
     reason = "muestra_insuficiente"
-    if sample > 0 and confirmadores >= int(_ctt_min_confirmadores()) and (wave_age_s is None or wave_age_s <= W):
-        if ratio >= float(CTT_THR_GREEN):
-            status = "GREEN"
-            reason = "ola_green"
-        elif ratio <= float(CTT_THR_RED):
-            status = "RED"
-            reason = "ola_red"
+
+    enough_evidence = bool(sample > 0 and confirmadores >= int(_ctt_min_confirmadores()) and wave_ttl_ok)
+    if enough_evidence:
+        if ratio <= float(CTT_THR_RED):
+            regime = "RED"
+            status = "RED_STRONG"
+            gate = "BLOCK"
+            roof_policy = "not_evaluated"
+            roof_delta = 0.0
+            reason = "regime_red_strong"
+        elif ratio <= float(CTT_THR_RED_WEAK):
+            regime = "RED"
+            status = "RED_WEAK"
+            gate = "NEUTRAL"
+            roof_policy = "harden"
+            roof_delta = -abs(float(CTT_RED_WEAK_SCORE_PENALTY))
+            reason = "regime_red_weak"
+        elif ratio >= float(CTT_THR_GREEN):
+            regime = "GREEN"
+            advanced_marti = bool(int(ciclo_martingala_siguiente()) > 1)
+            green_operable = (
+                ratio >= float(CTT_THR_GREEN_OPERABLE)
+                and density_cpm >= float(CTT_DENSITY_MIN_CPM)
+                and (not redundancy_high)
+            )
+            if (not CTT_ENABLE_GREEN_IN_MARTI_ADVANCED) and advanced_marti:
+                status = "GREEN_DIAGNOSTIC"
+                green_mode = "diagnostic"
+                gate = "NEUTRAL"
+                roof_policy = "normal"
+                reason = "green_marti_brake"
+            elif green_operable:
+                status = "GREEN_OPERABLE"
+                green_mode = "operable"
+                gate = "ALLOW_REZAGADOS"
+                roof_policy = "soften"
+                roof_delta = abs(float(CTT_GREEN_OPERABLE_SCORE_BONUS))
+                reason = "green_operable"
+            else:
+                status = "GREEN_DIAGNOSTIC"
+                green_mode = "diagnostic"
+                gate = "NEUTRAL"
+                roof_policy = "normal"
+                reason = "green_diagnostic"
+        elif ratio >= float(CTT_THR_GREEN_WEAK):
+            regime = "GREEN"
+            status = "GREEN_DIAGNOSTIC"
+            green_mode = "diagnostic"
+            gate = "NEUTRAL"
+            roof_policy = "normal"
+            reason = "green_weak"
         else:
+            status = "NEUTRAL"
             reason = "zona_neutral"
+    else:
+        if not wave_ttl_ok:
+            reason = "wave_ttl_expirada"
+        elif sample < 1 or confirmadores < int(_ctt_min_confirmadores()):
+            reason = "muestra_insuficiente"
 
     last_ts_bot = {}
     for ev in eventos:
@@ -12952,28 +13065,57 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
         tsb = float(last_ts_bot.get(str(b), 0.0) or 0.0)
         if tsb <= 0:
             continue
-        lag = max(0.0, ts0 - tsb)
-        if float(CTT_LAG_MIN_S) <= lag <= float(lag_max):
+        lag = max(0.0, t_front - tsb)
+        if lag_min <= lag <= lag_max and wave_ttl_ok:
             rezagados_validos.append(str(b))
 
+    no_participantes = [str(b) for b in BOT_NAMES if str(b) not in bots_wave and str(b) not in set(rezagados_validos)]
+
+    def _adj_score(cand, delta):
+        if not isinstance(cand, tuple) or len(cand) < 1:
+            return cand
+        try:
+            sc = float(cand[0])
+        except Exception:
+            return cand
+        sc2 = float(max(0.0, min(1.0, sc + float(delta))))
+        tmp = list(cand)
+        tmp[0] = sc2
+        return tuple(tmp)
+
     filtrados = list(candidatos)
-    if status == "RED":
+    if gate == "BLOCK":
         filtrados = []
-    elif status == "GREEN":
-        filtrados = [c for c in candidatos if len(c) > 1 and str(c[1]) in set(rezagados_validos)]
-    elif status == "NEUTRAL" and str(CTT_NEUTRAL_POLICY).lower() == "block":
-        filtrados = []
+    elif gate == "ALLOW_REZAGADOS":
+        rez_set = set(rezagados_validos)
+        filtrados = [_adj_score(c, roof_delta) for c in candidatos if len(c) > 1 and str(c[1]) in rez_set]
+    else:
+        if roof_policy == "harden" and abs(roof_delta) > 0:
+            filtrados = [_adj_score(c, roof_delta) for c in candidatos]
+        if str(CTT_NEUTRAL_POLICY).lower() == "block":
+            filtrados = []
 
     st = {
         "status": status,
+        "regime": regime,
+        "gate": gate,
         "asset": asset or None,
-        "wave_start": ts0,
+        "t_front": t_front,
+        "wave_start": ts_min,
         "wave_age_s": wave_age_s,
+        "wave_ttl_ok": wave_ttl_ok,
         "wave_ratio": float(ratio),
         "wave_total": int(sample),
         "confirmadores": int(confirmadores),
+        "density_cpm": float(density_cpm),
+        "diversity_ratio": float(diversity_ratio),
+        "redundancy_high": bool(redundancy_high),
+        "green_mode": green_mode,
         "rezagados_validos": list(rezagados_validos),
+        "no_participantes": list(no_participantes),
         "sample": int(sample),
+        "roof_policy": roof_policy,
+        "roof_delta": float(roof_delta),
         "reason": reason,
     }
     CTT_STATE.update(st)
@@ -13776,7 +13918,23 @@ async def main():
                         # Candidatos: prob válida, reciente, IA activa (no OFF)
                         candidatos = []
                         diag_gate = _leer_gate_desde_diagnostico(ttl_s=60.0)
+                        # CTT como autoridad contextual superior: si hay veto duro,
+                        # no se evalúan señales individuales/techo en este tick.
+                        ctt_pre_eval = None
                         if not lock_activo:
+                            try:
+                                _dummy, ctt_pre_eval = evaluar_ctt_fase([])
+                            except Exception:
+                                ctt_pre_eval = None
+
+                        if not lock_activo and str((ctt_pre_eval or {}).get("gate", "NEUTRAL")) == "BLOCK":
+                            ctt_status_pre = str((ctt_pre_eval or {}).get("status", "RED_STRONG"))
+                            ctt_reason_pre = str((ctt_pre_eval or {}).get("reason", "ctt_block"))
+                            agregar_evento(
+                                f"🟥 CTT veto previo ({ctt_status_pre}): techo/noise skip en tick ({ctt_reason_pre})."
+                            )
+                            candidatos = []
+                        elif not lock_activo:
                             for b in BOT_NAMES:
                                 try:
                                     modo_b = str(estado_bots.get(b, {}).get("modo_ia", "off")).lower()
@@ -13965,16 +14123,27 @@ async def main():
                             candidatos, ctt_eval = evaluar_ctt_fase(candidatos)
                             if candidatos_prev > 0:
                                 ctt_status = str(ctt_eval.get("status", "NEUTRAL"))
-                                if ctt_status == "RED":
+                                ctt_gate = str(ctt_eval.get("gate", "NEUTRAL"))
+                                ctt_reason = str(ctt_eval.get("reason", "na"))
+                                if ctt_gate == "BLOCK":
                                     agregar_evento(
-                                        f"🟥 CTT veto: ola {ctt_eval.get('asset','NA') or 'NA'} "
+                                        f"🟥 CTT veto ({ctt_status}): ola {ctt_eval.get('asset','NA') or 'NA'} "
                                         f"wr={float(ctt_eval.get('wave_ratio',0.0))*100:.1f}% "
-                                        f"m={int(ctt_eval.get('confirmadores',0))}/{_ctt_min_confirmadores()}."
+                                        f"m={int(ctt_eval.get('confirmadores',0))}/{_ctt_min_confirmadores()} · techo=NO-EVAL."
                                     )
-                                elif ctt_status == "GREEN" and len(candidatos) < candidatos_prev:
+                                elif ctt_gate == "ALLOW_REZAGADOS" and len(candidatos) < candidatos_prev:
                                     agregar_evento(
-                                        f"🟩 CTT fase: {len(candidatos)}/{candidatos_prev} candidatos rezagados válidos "
-                                        f"(lag {int(CTT_LAG_MIN_S)}-{int(CTT_LAG_MAX_FACTOR*CTT_WINDOW_S)}s)."
+                                        f"🟩 CTT verde operable: {len(candidatos)}/{candidatos_prev} rezagados válidos "
+                                        f"(lag {int(CTT_LAG_MIN_S)}-{int(CTT_LAG_MAX_S)}s, dens={float(ctt_eval.get('density_cpm',0.0)):.2f}/min)."
+                                    )
+                                elif ctt_status == "GREEN_DIAGNOSTIC":
+                                    agregar_evento(
+                                        f"🟨 CTT verde diagnóstica: sin habilitación ({ctt_reason}) "
+                                        f"dens={float(ctt_eval.get('density_cpm',0.0)):.2f}/min redun={'sí' if bool(ctt_eval.get('redundancy_high', False)) else 'no'}."
+                                    )
+                                elif ctt_status == "RED_WEAK":
+                                    agregar_evento(
+                                        f"🟧 CTT rojo débil: endurece evaluación individual (delta={float(ctt_eval.get('roof_delta',0.0))*100:+.1f} pts)."
                                     )
 
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
