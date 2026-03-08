@@ -2003,6 +2003,7 @@ async def ejecutar_panel():
                 print(Fore.YELLOW + Style.BRIGHT + "Reinicio forzado detectado. (reconectando sin salir)")
                 reinicio_forzado.clear()
                 indefinidos_consecutivos = 0
+                reintentos_busqueda_consecutivos = 0
 
                 await _cerrar_ws(ws)
                 ws = None
@@ -2040,6 +2041,7 @@ async def ejecutar_panel():
             estado_bot["reinicios_consecutivos"] = 0
             N = len(martingala)
             indefinidos_consecutivos = 0
+            reintentos_busqueda_consecutivos = 0
 
             while ciclo <= N and (not stop_event.is_set()):
 
@@ -2080,7 +2082,16 @@ async def ejecutar_panel():
                 symbol, direccion, rsi9, rsi14, sma5, sma20, breakout, cruce, condiciones, rsi_reversion = await buscar_estrategia(ws, ciclo, current_token)
 
                 if symbol == "REINTENTAR" or symbol is None:
+                    reintentos_busqueda_consecutivos += 1
+                    if reintentos_busqueda_consecutivos >= 3:
+                        print(Fore.YELLOW + Style.BRIGHT + f"Sin señal tras {reintentos_busqueda_consecutivos} rondas completas. Reabriendo WS y manteniendo ciclo #{ciclo}.")
+                        await _cerrar_ws(ws)
+                        ws = await _abrir_ws(current_token)
+                        reintentos_busqueda_consecutivos = 0
+                        await asyncio.sleep(1.0 + random.uniform(0.0, 0.5))
                     continue
+
+                reintentos_busqueda_consecutivos = 0
 
                 if not all([direccion, rsi9 is not None, rsi14 is not None]):
                     print(Fore.YELLOW + "Datos de estrategia incompletos. Reintentando ciclo.")
