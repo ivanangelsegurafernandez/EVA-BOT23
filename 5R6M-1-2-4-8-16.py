@@ -11870,12 +11870,20 @@ def _asegurar_estructura_datos_inicio() -> list[str]:
     except Exception as e:
         msgs.append(f"⚠️ Inicio seguro: no se pudo validar/reparar dataset_incremental ({e}).")
 
-    # 2) CSVs enriquecidos por bot: si falta/rompe header, se recrea SOLO header canónico.
+    # 2) CSVs enriquecidos por bot:
+    #    - Si falta, se crea con header canónico (evita arranques en LOW_DATA por ausencia de archivo base).
+    #    - Si existe y está roto, se respalda y se reescribe solo el header.
     header_ref = _csv_header_bot()
     required = {"resultado", "trade_status", "epoch", "monto"}
     for bot in BOT_NAMES:
         ruta = f"registro_enriquecido_{bot}.csv"
         if not os.path.exists(ruta):
+            try:
+                with open(ruta, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(header_ref)
+                msgs.append(f"🧱 Inicio seguro: creado {ruta} con header canónico.")
+            except Exception as e:
+                msgs.append(f"⚠️ Inicio seguro: no se pudo crear {ruta} ({e}).")
             continue
         try:
             header = None
