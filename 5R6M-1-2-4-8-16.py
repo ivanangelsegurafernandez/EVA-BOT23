@@ -13054,6 +13054,8 @@ def evaluar_ctt_fase(candidatos: list) -> tuple[list, dict]:
         elif sample < 1 or confirmadores < int(_ctt_min_confirmadores()):
             reason = "muestra_insuficiente"
 
+    status = regime
+
     last_ts_bot = {}
     for ev in eventos:
         b = str(ev.get("bot"))
